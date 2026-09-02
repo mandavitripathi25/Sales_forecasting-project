@@ -78,9 +78,7 @@ rather skip it, remove `"prophet"` from `ENSEMBLE_MODELS` in
 # Sales_forecasting-project
 End-to-end Sales Forecasting Pipeline using Python, ARIMA, XGBoost, and Ensemble Models with hierarchical forecasting, real-world data validation, and automated preprocessing.
 
-# 📈 Sales Forecasting Pipeline
 
-An end-to-end Sales Forecasting Pipeline built with Python for forecasting future sales using classical time series models and machine learning. The project supports hierarchical forecasting, automated preprocessing, ensemble modeling, model evaluation, and visualization.
 
 ---
 
@@ -270,9 +268,9 @@ Contains evaluation metrics including:
 # Installation
 
 ```bash
-git clone https://github.com/yourusername/sales_forecasting_pipeline.git
+git clone https://github.com/mandavitripathi25/Sales_forecasting-project.git
 
-cd sales_forecasting_pipeline
+cd sales_forecasting-pipeline
 
 python -m venv .venv
 
@@ -338,4 +336,4 @@ Generated outputs will be available in the **outputs/** directory.
 **Mandavi Tripathi**
 
 AI Engineer | Data Science | Machine Learning | Time Series Forecasting
->>>>>>> b12e2c69998b2ba672f12d959e066270516018e4
+
