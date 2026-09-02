@@ -1,0 +1,157 @@
+Metadata-Version: 2.4
+Name: interface_meta
+Version: 2.0.1
+Summary: `interface_meta` provides a convenient way to expose an extensible API with enforced method signatures and consistent documentation.
+Project-URL: Homepage, https://github.com/matthewwardrop/interface_meta
+Project-URL: Repository, https://github.com/matthewwardrop/interface_meta
+Author-email: Matthew Wardrop <mpwardrop@gmail.com>
+License: MIT
+License-File: LICENSE
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Environment :: Console
+Classifier: Intended Audience :: Developers
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Programming Language :: Python :: 3.14
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+
+# InterfaceMeta
+
+[![PyPI - Version](https://img.shields.io/pypi/v/interface_meta.svg)](https://pypi.org/project/interface_meta/)
+![PyPI - Python Version](https://img.shields.io/pypi/pyversions/interface_meta.svg)
+![PyPI - Status](https://img.shields.io/pypi/status/interface_meta.svg)
+[![CI](https://github.com/matthewwardrop/interface_meta/actions/workflows/ci.yml/badge.svg)](https://github.com/matthewwardrop/interface_meta/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/matthewwardrop/interface_meta/branch/master/graph/badge.svg?token=W4LD72EQMM)](https://codecov.io/gh/matthewwardrop/interface_meta)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+
+`interface_meta` provides a convenient way to expose an extensible API with
+enforced method signatures and consistent documentation.
+
+- **Documentation:** See below (full documentation will come at some point).
+- **Source:** https://github.com/matthewwardrop/interface_meta
+- **Bug reports:** https://github.com/matthewwardrop/interface_meta/issues
+
+## Overview
+
+This library has been extracted (with some modifications) from
+[`omniduct`](https://github.com/airbnb/omniduct), a library also principally
+written by this author, where it was central to the extensible plugin
+architecture. It places an emphasis on the functionality required to create a
+well-documented extensible plugin system, whereby the act of subclassing is
+sufficient to register the plugin and ensure compliance to the parent API. As
+such, this library boasts the following features:
+
+- All subclasses of an interface must conform to the parent's API.
+- Hierarchical runtime property existence and method signature checking. Methods
+  are permitted to add additional *optional* arguments, but otherwise must
+  conform to the API of their parent class (which themselves may have extended
+  the API of the interface).
+- Subclass definition time hooks (e.g. for registration of subclasses into a
+  library of plugins, etc).
+- Optional requirement for methods in subclasses to explicity decorate methods
+  with an `override` decorator when replacing methods on an interface, making
+  it clearer as to when a class is introducing new methods versus replacing
+  those that form the part of the interface API.
+- Generation of clear docstrings on implementations that stitches together the
+  base interface documentation with any downstream extensions and quirks.
+- Support for extracting the quirks documentation for a method from other method
+  docstrings, in the event that subclass implementations are done in an internal
+  method.
+- Compatibility with ABCMeta from the standard library.
+
+## Example code
+
+```python
+from abc import abstractmethod
+from interface_meta import InterfaceMeta, inherit_docs, override
+
+
+class MyInterface(metaclass=InterfaceMeta):
+    """
+    An example interface.
+    """
+
+    INTERFACE_EXPLICIT_OVERRIDES = True
+    INTERFACE_RAISE_ON_VIOLATION = False
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """
+        The name of this interface.
+        """
+
+    @inherit_docs(method="_do_stuff")
+    def do_stuff(self, a, b, c=1):
+        """
+        Do things with the parameters.
+        """
+        return self._do_stuff(a, b, c)
+
+    @abstractmethod
+    def _do_stuff(self, a, b, c):
+        pass
+
+
+class MyImplementation(MyInterface):
+    """
+    This implementation of the example interface works nicely.
+    """
+
+    @override
+    @property
+    def name(self) -> str:
+        return "Peter"
+
+    @override
+    def _do_stuff(self, a, b, c):
+        """
+        In this implementation, we sum the parameters.
+        """
+        return a + b + c
+```
+
+Running `help(MyImplementation)` reveals how the documentation is generated:
+
+```python
+class MyImplementation(MyInterface)
+ |  This implementation of the example interface works nicely.
+ |
+ |  Method resolution order:
+ |      MyImplementation
+ |      MyInterface
+ |      builtins.object
+ |
+ |  do_stuff(self, a, b, c=1)
+ |      Do things with the parameters.
+ |
+ |      MyImplementation Quirks:
+ |          In this implementation, we sum the parameters.
+ ...
+```
+
+## Related projects and prior art
+
+This library is released into an already crowded space, and the author would
+like to recognise some of the already wonderful work done by others. The primary
+difference between this and other libraries is typically these other libraries
+focus more on abstracting interface definitions and compliance, and less on the
+documentation and plugin registration work. While this work overlaps with these
+projects, its approach is sufficiently different (in the author's opinion)
+to warrant a separate library.
+
+- [`pure_interface`](https://github.com/seequent/pure_interface)
+- [`python-interface`](https://github.com/ssanderson/interface)
+
+`python-interface` has an emphasis on ensuring that implementations of various
+interfaces *strictly* adhere to the methods and properties associated with
+the interface, and that helpful errors are raised when this is violated.
+
+By
+comparison this library focusses on functional comformance to parent classes,
+whereby methods on subclasses are allowed to include additional parameters. It
+also focusses on ensuring that documentation for such quirks in method signatures are correctly composed into the final documentation rendered for that method.

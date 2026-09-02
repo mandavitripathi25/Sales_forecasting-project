@@ -1,0 +1,2 @@
+[console_scripts]
+holidays-ics = holidays.generate_ics:main

@@ -1,0 +1,7 @@
+pandas>=2.0
+numpy>=1.24
+openpyxl>=3.1
+xlrd>=2.0          # needed if your source file is an old-style .xls
+statsmodels>=0.14
+prophet>=1.1        # optional — remove from ENSEMBLE_MODELS in config.py if you skip this
+jupyter>=1.0

@@ -1,0 +1,979 @@
+from statsmodels.compat.scipy import SP_LT_116
+
+import warnings
+
+import numpy as np
+from numpy.testing import assert_allclose, assert_almost_equal, assert_equal
+import pytest
+
+from statsmodels import datasets
+from statsmodels.discrete.truncated_model import (
+    HurdleCountModel,
+    TruncatedLFNegativeBinomialP,
+    TruncatedLFPoisson,
+)
+from statsmodels.distributions.discrete import (
+    truncatednegbin,
+    truncatedpoisson,
+)
+from statsmodels.iolib.summary import Summary
+from statsmodels.sandbox.regression.tests.test_gmm_poisson import DATA
+from statsmodels.tools.numdiff import approx_fprime, approx_hess
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
+from statsmodels.tools.testing import Holder
+from statsmodels.tools.tools import add_constant
+
+from .results import (
+    results_truncated as results_t,
+    results_truncated_st as results_ts,
+)
+from .results.results_discrete import RandHIE
+from .test_discrete import (
+    CheckL1Compatability,
+    CheckLikelihoodModelL1,
+    load_randhie,
+)
+
+
+class CheckResults:
+    def test_params(self):
+        assert_allclose(self.res1.params, self.res2.params, atol=1e-5, rtol=1e-5)
+
+    def test_llf(self):
+        assert_allclose(self.res1.llf, self.res2.llf, atol=1e-5, rtol=1e-7)
+
+    def test_conf_int(self):
+        assert_allclose(self.res1.conf_int(), self.res2.conf_int, atol=1e-3, rtol=1e-5)
+
+    def test_bse(self):
+        assert_allclose(self.res1.bse, self.res2.bse, atol=1e-3)
+
+    def test_aic(self):
+        assert_allclose(self.res1.aic, self.res2.aic, atol=1e-2, rtol=1e-12)
+
+    def test_bic(self):
+        assert_allclose(self.res1.bic, self.res2.bic, atol=1e-2, rtol=1e-12)
+
+    def test_fit_regularized(self):
+        model = self.res1.model
+        alpha = np.ones(len(self.res1.params))
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=ConvergenceWarning)
+            # This does not catch all Convergence warnings, why?
+            res_reg = model.fit_regularized(alpha=alpha * 0.01, disp=0)
+
+        if self.__class__.__name__ == "TestTruncatedLFPoissonModel" and not SP_LT_116:
+            pytest.xfail(
+                "TruncatedLFPoissonModel fails regularized fit when using SciPy 1.16+"
+            )
+        assert_allclose(res_reg.params, self.res1.params, rtol=1e-3, atol=5e-3)
+        assert_allclose(res_reg.bse, self.res1.bse, rtol=1e-3, atol=5e-3)
+
+
+class TestTruncatedLFPoissonModel(CheckResults):
+    @classmethod
+    def setup_class(cls):
+        data = datasets.randhie.load()
+        exog = add_constant(np.asarray(data.exog)[:, :4], prepend=False)
+        mod = TruncatedLFPoisson(data.endog, exog, truncation=5)
+        cls.res1 = mod.fit(method="newton", maxiter=500)
+        res2 = RandHIE()
+        res2.truncated_poisson()
+        cls.res2 = res2
+
+
+class TestZeroTruncatedLFPoissonModel(CheckResults):
+    @classmethod
+    def setup_class(cls):
+        data = datasets.randhie.load()
+        exog = add_constant(np.asarray(data.exog)[:, :4], prepend=False)
+        mod = TruncatedLFPoisson(data.endog, exog, truncation=0)
+        cls.res1 = mod.fit(maxiter=500)
+        res2 = RandHIE()
+        res2.zero_truncated_poisson()
+        cls.res2 = res2
+
+
+class TestZeroTruncatedNBPModel(CheckResults):
+    @classmethod
+    def setup_class(cls):
+        data = datasets.randhie.load()
+        exog = add_constant(np.asarray(data.exog)[:, :3], prepend=False)
+        mod = TruncatedLFNegativeBinomialP(data.endog, exog, truncation=0)
+        cls.res1 = mod.fit(maxiter=500)
+        res2 = RandHIE()
+        res2.zero_truncted_nbp()
+        cls.res2 = res2
+
+    def test_conf_int(self):
+        pass
+
+
+class TestTruncatedLFPoisson_predict:
+    @classmethod
+    def setup_class(cls):
+        cls.expected_params = [1, 0.5]
+        rs = np.random.RandomState(123)
+        nobs = 200
+        exog = np.ones((nobs, 2))
+        exog[: nobs // 2, 1] = 2
+        mu_true = exog.dot(cls.expected_params)
+        cls.endog = truncatedpoisson.rvs(
+            mu_true, 0, size=mu_true.shape, random_state=rs
+        )
+        model = TruncatedLFPoisson(cls.endog, exog, truncation=0)
+        cls.res = model.fit(method="bfgs", maxiter=5000)
+
+    def test_mean(self):
+        assert_allclose(
+            self.res.predict().mean(), self.endog.mean(), atol=2e-1, rtol=2e-1
+        )
+
+    def test_var(self):
+        v = self.res.predict(which="var").mean()
+        assert_allclose(v, self.endog.var(), atol=2e-1, rtol=2e-1)
+        return
+        assert_allclose(
+            (self.res.predict().mean() * self.res._dispersion_factor.mean()),
+            self.endog.var(),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+    def test_predict_prob(self):
+        res = self.res
+
+        pr = res.predict(which="prob")
+        pr2 = truncatedpoisson.pmf(
+            np.arange(8), res.predict(which="mean-main")[:, None], 0
+        )
+        assert_allclose(pr, pr2, rtol=1e-10, atol=1e-10)
+
+
+class TestTruncatedNBP_predict:
+    @classmethod
+    def setup_class(cls):
+        cls.expected_params = [1, 0.5, 0.5]
+        rs = np.random.RandomState(1234)
+        nobs = 200
+        exog = np.ones((nobs, 2))
+        exog[: nobs // 2, 1] = 2
+        mu_true = np.exp(exog.dot(cls.expected_params[:-1]))
+        cls.endog = truncatednegbin.rvs(
+            mu_true, cls.expected_params[-1], 2, 0, size=mu_true.shape, random_state=rs
+        )
+        model = TruncatedLFNegativeBinomialP(cls.endog, exog, truncation=0, p=2)
+        cls.res = model.fit(method="nm", maxiter=5000, maxfun=5000)
+
+    def test_mean(self):
+        assert_allclose(
+            self.res.predict().mean(), self.endog.mean(), atol=2e-1, rtol=2e-1
+        )
+
+    def test_var(self):
+        v = self.res.predict(which="var").mean()
+        assert_allclose(v, self.endog.var(), atol=1e-1, rtol=1e-2)
+        return
+        assert_allclose(
+            (self.res.predict().mean() * self.res._dispersion_factor.mean()),
+            self.endog.var(),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+    def test_predict_prob(self):
+        res = self.res
+
+        pr = res.predict(which="prob")
+        pr2 = truncatednegbin.pmf(
+            np.arange(29), res.predict(which="mean-main")[:, None], res.params[-1], 2, 0
+        )
+        assert_allclose(pr, pr2, rtol=1e-10, atol=1e-10)
+
+
+class CheckTruncatedST:
+
+    def test_basic(self):
+        res1 = self.res1
+        res2 = self.res2
+
+        assert_allclose(res1.llf, res2.ll, rtol=1e-8)
+        assert_allclose(res1.llnull, res2.ll_0, rtol=5e-6)
+        pt2 = res2.params_table
+        # Stata has different parameterization of alpha for negbin
+        k = res1.model.exog.shape[1]
+        assert_allclose(res1.params[:k], res2.params[:k], atol=1e-5)
+        assert_allclose(res1.bse[:k], pt2[:k, 1], atol=1e-5)
+        assert_allclose(res1.tvalues[:k], pt2[:k, 2], rtol=5e-4, atol=5e-4)
+        assert_allclose(res1.pvalues[:k], pt2[:k, 3], rtol=5e-4, atol=1e-7)
+
+        assert_equal(res1.df_model, res2.df_m)
+        assert_allclose(res1.aic, res2.icr[-2], rtol=1e-8)
+        assert_allclose(res1.bic, res2.icr[-1], rtol=1e-8)
+        nobs = res1.model.endog.shape[0]
+        assert_equal((res1.model.endog < 1).sum(), 0)
+        # df_resid not available in Stata
+        assert_equal(res1.df_resid, nobs - len(res1.params))
+
+    def test_predict(self):
+        res1 = self.res1
+        res2 = self.res2
+
+        # mean of untruncated distribution
+        rdf = res2.margins_means.table
+        pred = res1.get_prediction(which="mean-main", average=True)
+        assert_allclose(pred.predicted, rdf[0], rtol=5e-5)
+        assert_allclose(pred.se, rdf[1], rtol=5e-4, atol=1e-10)
+        ci = pred.conf_int()[0]
+        assert_allclose(ci[0], rdf[4], rtol=1e-5, atol=1e-10)
+        assert_allclose(ci[1], rdf[5], rtol=1e-5, atol=1e-10)
+
+        # mean of untruncated distribution, evaluated and exog.mean()
+        ex = res1.model.exog.mean(0)
+        rdf = res2.margins_atmeans.table
+        pred = res1.get_prediction(ex, which="mean-main")
+        assert_allclose(pred.predicted, rdf[0], rtol=5e-5)
+        assert_allclose(pred.se, rdf[1], rtol=5e-4, atol=1e-10)
+        ci = pred.conf_int()[0]
+        assert_allclose(ci[0], rdf[4], rtol=5e-5, atol=1e-10)
+        assert_allclose(ci[1], rdf[5], rtol=5e-5, atol=1e-10)
+
+        # mean of truncated distribution, E(y | y > trunc)
+        rdf = res2.margins_cm.table
+        try:
+            pred = res1.get_prediction(average=True)
+        except NotImplementedError:
+            # not yet implemented for truncation > 0
+            pred = None
+        if pred is not None:
+            assert_allclose(pred.predicted, rdf[0], rtol=5e-5)
+            assert_allclose(pred.se, rdf[1], rtol=1e-5, atol=1e-10)
+            ci = pred.conf_int()[0]
+            assert_allclose(ci[0], rdf[4], rtol=1e-5, atol=1e-10)
+            assert_allclose(ci[1], rdf[5], rtol=1e-5, atol=1e-10)
+
+        # predicted probabilites, only subset is common to reference
+        ex = res1.model.exog.mean(0)
+        rdf = res2.margins_cpr.table
+        start_idx = res1.model.truncation + 1
+        k = rdf.shape[0] + res1.model.truncation
+        pred = res1.get_prediction(which="prob", average=True)
+        assert_allclose(pred.predicted[start_idx:k], rdf[:-1, 0], rtol=5e-5)
+        assert_allclose(pred.se[start_idx:k], rdf[:-1, 1], rtol=5e-4, atol=1e-10)
+        ci = pred.conf_int()[start_idx:k]
+        assert_allclose(ci[:, 0], rdf[:-1, 4], rtol=5e-5, atol=1e-10)
+        assert_allclose(ci[:, 1], rdf[:-1, 5], rtol=5e-5, atol=1e-10)
+
+        # untruncated predicted probabilites, subset is common to reference
+        ex = res1.model.exog.mean(0)
+        rdf = res2.margins_pr.table
+        k = rdf.shape[0] - 1
+        pred = res1.get_prediction(which="prob-base", average=True)
+        assert_allclose(pred.predicted[:k], rdf[:-1, 0], rtol=5e-5)
+        assert_allclose(pred.se[:k], rdf[:-1, 1], rtol=8e-4, atol=1e-10)
+        ci = pred.conf_int()[:k]
+        assert_allclose(ci[:, 0], rdf[:-1, 4], rtol=5e-4, atol=1e-10)
+        assert_allclose(ci[:, 1], rdf[:-1, 5], rtol=5e-4, atol=1e-10)
+
+
+class TestTruncatedLFPoissonSt(CheckTruncatedST):
+    # test against R pscl
+    @classmethod
+    def setup_class(cls):
+        endog = DATA["docvis"]
+        exog_names = ["aget", "totchr", "const"]
+        exog = DATA[exog_names]
+        cls.res1 = TruncatedLFPoisson(endog, exog).fit(method="bfgs", maxiter=300)
+        cls.res2 = results_ts.results_trunc_poisson
+
+        mod_offset = TruncatedLFPoisson(endog, exog, offset=DATA["aget"])
+        cls.res_offset = mod_offset.fit(method="bfgs", maxiter=300)
+
+    def test_offset(self):
+        res1 = self.res1
+        reso = self.res_offset
+
+        paramso = np.asarray(reso.params)
+        params1 = np.asarray(res1.params)
+        assert_allclose(paramso[1:], params1[1:], rtol=1e-8)
+        assert_allclose(paramso[0], params1[0] - 1, rtol=1e-8)
+        pred1 = res1.predict()
+        predo = reso.predict()
+        assert_allclose(predo, pred1, rtol=1e-8)
+
+        ex = res1.model.exog[:5]
+        offs = reso.model.offset[:5]
+        pred1 = res1.predict(ex, transform=False)
+        predo = reso.predict(ex, offset=offs, transform=False)
+        assert_allclose(predo, pred1, rtol=1e-8)
+
+
+class TestTruncatedNegBinSt(CheckTruncatedST):
+    # test against R pscl
+    @classmethod
+    def setup_class(cls):
+        endog = DATA["docvis"]
+        exog_names = ["aget", "totchr", "const"]
+        exog = DATA[exog_names]
+        cls.res1 = TruncatedLFNegativeBinomialP(endog, exog).fit(
+            method="bfgs", maxiter=300
+        )
+        cls.res2 = results_ts.results_trunc_negbin
+
+        mod_offset = TruncatedLFNegativeBinomialP(endog, exog, offset=DATA["aget"])
+        cls.res_offset = mod_offset.fit(method="bfgs", maxiter=300)
+
+    def test_offset(self):
+        # identical, copy of method in TestTruncatedLFPoissonSt
+        res1 = self.res1
+        reso = self.res_offset
+
+        paramso = np.asarray(reso.params)
+        params1 = np.asarray(res1.params)
+        assert_allclose(paramso[1:], params1[1:], rtol=1e-8)
+        assert_allclose(paramso[0], params1[0] - 1, rtol=1e-8)
+        pred1 = res1.predict()
+        predo = reso.predict()
+        assert_allclose(predo, pred1, rtol=1e-8)
+
+        ex = res1.model.exog[:5]
+        offs = reso.model.offset[:5]
+        pred1 = res1.predict(ex, transform=False)
+        predo = reso.predict(ex, offset=offs, transform=False)
+        assert_allclose(predo, pred1, rtol=1e-8)
+
+
+class TestTruncatedLFPoisson1St(CheckTruncatedST):
+    # test against R pscl
+    @classmethod
+    def setup_class(cls):
+        endog = DATA["docvis"]
+        exog_names = ["aget", "totchr", "const"]
+        exog = DATA[exog_names]
+        cls.res1 = TruncatedLFPoisson(endog, exog, truncation=1).fit(
+            method="bfgs", maxiter=300
+        )
+        cls.res2 = results_ts.results_trunc_poisson1
+
+
+class TestTruncatedNegBin1St(CheckTruncatedST):
+    # test against R pscl
+    @classmethod
+    def setup_class(cls):
+        endog = DATA["docvis"]
+        exog_names = ["aget", "totchr", "const"]
+        exog = DATA[exog_names]
+        cls.res1 = TruncatedLFNegativeBinomialP(endog, exog, truncation=1).fit(
+            method="newton", maxiter=300
+        )  # "bfgs" is not close enough
+        cls.res2 = results_ts.results_trunc_negbin1
+
+
+class TestHurdlePoissonR:
+    # test against R pscl
+    @classmethod
+    def setup_class(cls):
+        endog = DATA["docvis"]
+        exog_names = ["const", "aget", "totchr"]
+        exog = DATA[exog_names]
+        cls.res1 = HurdleCountModel(endog, exog).fit(method="newton", maxiter=300)
+        cls.res2 = results_t.hurdle_poisson
+
+    def test_basic(self):
+        res1 = self.res1
+        res2 = self.res2
+
+        assert_allclose(res1.llf, res2.loglik, rtol=1e-8)
+        pt2 = res2.params_table
+        assert_allclose(res1.params, pt2[:, 0], atol=1e-5)
+        assert_allclose(res1.bse, pt2[:, 1], atol=1e-5)
+        assert_allclose(res1.tvalues, pt2[:, 2], rtol=5e-4, atol=5e-4)
+        assert_allclose(res1.pvalues, pt2[:, 3], rtol=5e-4, atol=1e-7)
+
+        assert_equal(res1.df_resid, res2.df_residual)
+        assert_equal(res1.df_model, res2.df_null - res2.df_residual)
+        assert_allclose(res1.aic, res2.aic, rtol=1e-8)
+
+        # we have zero model first
+        idx = np.concatenate((np.arange(3, 6), np.arange(3)))
+        vcov = res2.vcov[idx[:, None], idx]
+        assert_allclose(np.asarray(res1.cov_params()), vcov, rtol=1e-4, atol=1e-8)
+
+    def test_predict(self):
+        res1 = self.res1
+        res2 = self.res2
+
+        ex = res1.model.exog.mean(0, keepdims=True)
+        mu1 = res1.results_zero.predict(ex)
+        prob_zero = np.exp(-mu1)
+        prob_nz = 1 - prob_zero
+        assert_allclose(prob_nz, res2.predict_zero, rtol=5e-4, atol=5e-4)
+        prob_nz_ = res1.results_zero.model._prob_nonzero(mu1, res1.params[:4])
+        assert_allclose(prob_nz_, res2.predict_zero, rtol=5e-4, atol=5e-4)
+
+        mean_main = res1.results_count.predict(ex, which="mean-main")
+        assert_allclose(mean_main, res2.predict_mean_main, rtol=5e-4, atol=5e-4)
+
+        prob_main = res1.results_count.predict(ex, which="prob")[0] * prob_nz
+        prob_main[0] = np.squeeze(prob_zero)
+        assert_allclose(prob_main[:4], res2.predict_prob, rtol=5e-4, atol=5e-4)
+
+        assert_allclose(mean_main * prob_nz, res2.predict_mean, rtol=1e-3, atol=5e-4)
+
+        # with corresponding predict `which`
+        m = res1.predict(ex)
+        assert_allclose(m, res2.predict_mean, rtol=1e-6, atol=5e-7)
+        mm = res1.predict(ex, which="mean-main")
+        assert_allclose(mm, res2.predict_mean_main, rtol=1e-7, atol=1e-7)
+        mnz = res1.predict(ex, which="mean-nonzero")
+        assert_allclose(
+            mnz, res2.predict_mean / (1 - res2.predict_prob[0]), rtol=5e-7, atol=5e-7
+        )
+        prob_main = res1.predict(ex, which="prob-main")
+        pt = res1.predict(ex, which="prob-trunc")
+        assert_allclose(prob_main / (1 - pt), res2.predict_zero, rtol=5e-4, atol=5e-4)
+        probs = res1.predict(ex, which="prob")[0]  # return is 2-dim
+        assert_allclose(probs[:4], res2.predict_prob, rtol=1e-5, atol=1e-6)
+
+        # check vectorized and options, consistencey and smoke
+        k_ex = 5
+        ex5 = res1.model.exog[:k_ex]
+        p1a = res1.predict(ex5, which="prob", y_values=np.arange(3))
+        p1b = res1.get_prediction(ex5, which="prob", y_values=np.arange(3))
+        assert_allclose(p1a, p1b.predicted, rtol=1e-10, atol=1e-10)
+        # TODO: two dim prediction not yet supported in frame
+        # assert p1b.summary_frame().shape == (4, 4)
+
+        p2a = res1.predict(which="prob", y_values=np.arange(3))
+        p2b = res1.get_prediction(which="prob", y_values=np.arange(3), average=True)
+        assert_allclose(p2a.mean(0), p2b.predicted, rtol=1e-10, atol=1e-10)
+
+        # TODO: which="var" raises AttributeError
+        for which in ["mean", "mean-main", "prob-main", "prob-zero", "linear"]:
+            p3a = res1.predict(ex5, which=which)
+            p3b = res1.get_prediction(ex5, which=which)
+            assert_allclose(p3a, p3b.predicted, rtol=1e-10, atol=1e-10)
+            assert p3b.summary_frame().shape == (k_ex, 4)
+
+        # var1 = res1.predict(which="var")
+        resid_p1 = res1.resid_pearson[:5]
+        resid_p2 = np.asarray(
+            [
+                -1.5892397298897,
+                -0.3239276467705,
+                -1.5878941800178,
+                0.6613236544236,
+                -0.6690997162962,
+            ]
+        )
+        assert_allclose(resid_p1, resid_p2, rtol=1e-5, atol=1e-5)
+
+
+class CheckHurdlePredict:
+
+    def test_basic(self):
+        res1 = self.res1
+        res2 = self.res2
+        assert res1.df_model == res2.df_model
+        # assert res1.df_null == res2.df_null  # not in res1
+        assert res1.df_resid == res2.df_resid
+        assert res1.model.k_extra == res2.k_extra
+        assert len(res1.model.exog_names) == res2.k_params
+        assert res1.model.exog_names == res2.exog_names
+
+        # smoke test
+        res1.summary()
+
+    def test_score_numerical(self):
+        model = self.res1.model
+        params = self.res1.params
+        analytical_score = model.score(params)
+        numerical_score = approx_fprime(params, model.loglike)
+        assert_allclose(analytical_score, numerical_score, rtol=1e-3, atol=5e-4)
+
+    def test_score_consistency(self):
+        model = self.res1.model
+        params = self.res1.params
+        score_from_obs = model.score_obs(params).sum(0)
+        direct_score = model.score(params)
+        assert_allclose(score_from_obs, direct_score, rtol=1e-12)
+
+    def test_hessian_numerical(self):
+        model = self.res1.model
+        params = self.res1.params
+        analytical_hessian = model.hessian(params)
+        numerical_hessian = approx_hess(params, model.loglike)
+        # The cross-model block is analytically zero but is only zero up to
+        # approximation error in approx_hess, and that error scales with the
+        # magnitude of the Hessian, so the absolute tolerance has to as well.
+        # A fixed atol makes this test depend on the BLAS in use.
+        atol = 1e-6 * np.abs(numerical_hessian).max()
+        assert_allclose(
+            analytical_hessian, numerical_hessian, rtol=1e-4, atol=atol
+        )
+
+    def test_predict(self, close_figures):
+        res1 = self.res1
+        endog = res1.model.endog
+        exog = res1.model.exog
+
+        pred_mean = res1.predict(which="mean").mean()
+        assert_allclose(pred_mean, endog.mean(), rtol=1e-2)
+
+        mask_nz = endog > 0
+        mean_nz = endog[mask_nz].mean()
+        pred_mean_nz = res1.predict(which="mean-nonzero").mean()
+        assert_allclose(pred_mean_nz, mean_nz, rtol=0.05)
+        # Note: the Truncated model is based on different exog
+        # prediction for nonzero part is better in nonzero sample than full
+        pred_mean_nnz = res1.predict(exog=exog[mask_nz], which="mean-nonzero").mean()
+        assert_allclose(pred_mean_nnz, mean_nz, rtol=5e-4)
+
+        pred_mean_nzm = res1.results_count.predict(which="mean").mean()
+        assert_allclose(pred_mean_nzm, mean_nz, rtol=5e-4)
+        assert_allclose(pred_mean_nzm, pred_mean_nnz, rtol=1e-4)
+
+        # check variance
+        pred_var = res1.predict(which="var").mean()
+        assert_allclose(pred_var, res1.resid.var(), rtol=0.05)
+
+        pred_var = res1.results_count.predict(which="var").mean()
+        assert_allclose(pred_var, res1.resid[endog > 0].var(), rtol=0.05)
+
+        # check probabilities
+        freq = np.bincount(endog.astype(int)) / len(endog)
+        pred_prob = res1.predict(which="prob").mean(0)
+        assert_allclose(pred_prob, freq, rtol=0.005, atol=0.01)
+        dia_hnb = res1.get_diagnostic()
+        assert_allclose(dia_hnb.probs_predicted.mean(0), pred_prob, rtol=1e-10)
+        try:
+            dia_hnb.plot_probs()
+        except ImportError:
+            pass
+
+        pred_prob0 = res1.predict(which="prob-zero").mean(0)
+        assert_allclose(pred_prob0, freq[0], rtol=1e-4)
+        assert_allclose(pred_prob0, pred_prob[0], rtol=1e-10)
+
+
+class TestHurdleNegbinSimulated(CheckHurdlePredict):
+
+    @classmethod
+    def setup_class(cls):
+
+        nobs = 2000
+        exog = np.column_stack((np.ones(nobs), np.linspace(0, 3, nobs)))
+        y_fake = np.arange(nobs) // (nobs / 3)  # need some zeros and non-zeros
+
+        # get predicted probabilities for model
+        mod = HurdleCountModel(y_fake, exog, dist="negbin", zerodist="negbin")
+        p_dgp = np.array([-0.4, 2, 0.5, 0.2, 0.5, 0.5])
+        probs = mod.predict(p_dgp, which="prob", y_values=np.arange(50))
+        cdf = probs.cumsum(1)
+        n = cdf.shape[0]
+        cdf = np.column_stack((cdf, np.ones(n)))
+
+        # simulate data,
+        # cooked example that doesn't have identification problems
+        rng = np.random.default_rng(987456348)
+        u = rng.random((n, 1))
+        endog = np.argmin(cdf < u, axis=1)
+
+        mod_hnb = HurdleCountModel(endog, exog, dist="negbin", zerodist="negbin")
+        cls.res1 = mod_hnb.fit(maxiter=300)
+
+        df_null = 4
+        cls.res2 = Holder(
+            nobs=nobs,
+            k_params=6,
+            df_model=2,
+            df_null=df_null,
+            df_resid=nobs - 6,
+            k_extra=df_null - 1,
+            exog_names=["zm_const", "zm_x1", "zm_alpha", "const", "x1", "alpha"],
+        )
+
+
+def _fit_truncated_lf_poisson_for_summary():
+    data = datasets.randhie.load()
+    exog = add_constant(np.asarray(data.exog)[:, :4], prepend=False)
+    mod = TruncatedLFPoisson(data.endog, exog, truncation=5)
+    return mod.fit(method="newton", maxiter=500)
+
+
+def _fit_truncated_negative_binomial_for_summary():
+    data = datasets.randhie.load()
+    exog = add_constant(np.asarray(data.exog)[:, :3], prepend=False)
+    mod = TruncatedLFNegativeBinomialP(data.endog, exog, truncation=0)
+    return mod.fit(maxiter=500)
+
+
+def _fit_hurdle_count_for_summary():
+    endog = DATA["docvis"]
+    exog_names = ["const", "aget", "totchr"]
+    exog = DATA[exog_names]
+    return HurdleCountModel(endog, exog).fit(method="newton", maxiter=300)
+
+
+@pytest.mark.parametrize(
+    "fit_func",
+    [
+        _fit_truncated_lf_poisson_for_summary,
+        _fit_truncated_negative_binomial_for_summary,
+        _fit_hurdle_count_for_summary,
+    ],
+    ids=[
+        "TruncatedLFPoisson",
+        "TruncatedLFNegativeBinomialP",
+        "HurdleCountModel",
+    ],
+)
+def test_summary_after_remove_data(fit_func):
+    # summary() must still work after remove_data() has been called
+    res = fit_func()
+    assert isinstance(res.summary(), Summary)
+    res.remove_data()
+    assert isinstance(res.summary(), Summary)
+
+
+def test_truncated_poisson_dispersion_factor():
+    rs = np.random.RandomState(462)
+    n = 300
+    exog = np.column_stack([np.ones(n), rs.standard_normal(n)])
+    lam = np.exp(exog @ [0.5, 0.3])
+    endog = rs.poisson(lam)
+    endog[endog == 0] = 1  # zero-truncated sample
+
+    mod = TruncatedLFPoisson(endog, exog, truncation=0)
+    res = mod.fit(disp=0)
+
+    mu = np.exp(res.predict(which="linear"))
+    expected = 1 - mu / (np.exp(mu) - 1)
+    assert_allclose(res._dispersion_factor, expected)
+
+    # the NotImplementedError guard is checked before any computation, so
+    # a single non-converged iteration is enough to exercise it
+    mod_trunc5 = TruncatedLFPoisson(endog, exog, truncation=5)
+    res_trunc5 = mod_trunc5.fit(disp=0, start_params=res.params, maxiter=1,
+                                skip_hessian=True)
+    with pytest.raises(NotImplementedError, match="zero-truncation"):
+        _ = res_trunc5._dispersion_factor
+
+
+def test_truncated_negative_binomial_dispersion_factor():
+    rs = np.random.RandomState(463)
+    n = 300
+    exog = np.column_stack([np.ones(n), rs.standard_normal(n)])
+    mu = np.exp(exog @ [0.5, 0.3])
+    alpha = 0.3
+    endog = rs.negative_binomial(1 / alpha, 1 / (1 + alpha * mu))
+    endog[endog == 0] = 1
+
+    mod = TruncatedLFNegativeBinomialP(endog, exog, truncation=0, p=2)
+    res = mod.fit(disp=0)
+
+    alpha_hat = res.params[-1]
+    p = mod.model_main.parameterization
+    mu_hat = np.exp(res.predict(which="linear"))
+    expected = 1 - alpha_hat * mu_hat ** (p - 1) / (
+        np.exp(mu_hat ** (p - 1)) - 1)
+    assert_allclose(res._dispersion_factor, expected)
+
+class CheckHurdleL1Coherence:
+    """
+    params, bse and trimmed must all describe the same fit.
+
+    params come from the joint refit, so the standard errors have to come
+    from the joint covariance too. Taking them from the two component fits
+    instead let a component trim a parameter that the joint fit kept, which
+    surfaced as a non-zero coefficient reported with a nan standard error.
+    """
+
+    def test_bse_agrees_with_trimmed(self):
+        res1 = self.res1
+        params = np.asarray(res1.params)
+        bse = np.asarray(res1.bse)
+        trimmed = np.asarray(res1.trimmed)
+        assert bse.shape == params.shape
+        # A trimmed parameter is exactly zero and has no standard error, an
+        # untrimmed one is non-zero and has a finite standard error.
+        assert_equal(np.isnan(bse), trimmed)
+        assert_equal(params[trimmed], 0)
+        assert np.all(np.isfinite(bse[~trimmed]))
+        assert res1.nnz_params == (~trimmed).sum()
+
+
+class TestRegularizedHurdleSimulated(CheckHurdlePredict, CheckHurdleL1Coherence):
+
+    @classmethod
+    def setup_class(cls):
+
+        # Follow the same setup as the other hurdle simulation
+        nobs = 2000
+        exog = np.column_stack((np.ones(nobs), np.linspace(0, 3, nobs)))
+        y_fake = np.arange(nobs) // (nobs / 3)  # need some zeros and non-zeros
+        mod = HurdleCountModel(y_fake, exog, dist="negbin", zerodist="negbin")
+        p_dgp = np.array([-0.4, 2, 0.5, 0.2, 0.5, 0.5])
+        k_params = p_dgp.size
+        probs = mod.predict(p_dgp, which="prob", y_values=np.arange(50))
+        cdf = probs.cumsum(1)
+        n = cdf.shape[0]
+        cdf = np.column_stack((cdf, np.ones(n)))
+        rng = np.random.default_rng(987456348)
+        u = rng.random((n, 1))
+        endog = np.argmin(cdf < u, axis=1)
+
+        mod_hnb = HurdleCountModel(endog, exog, dist="negbin", zerodist="negbin")
+        cls.res1 = mod_hnb.fit_regularized(
+            # Non-zero starting parameters are required when fitting a negative
+            # binomial with regularization
+            start_params=np.ones(k_params),
+            method="l1",
+            # Regularization in the zero model must be weak for mean predictions
+            # to match analytically derived expected values
+            alpha=np.array([0.01, 0.01, 0, 1, 1, 0]),
+            maxiter=300
+        )
+
+        df_model = 2
+        df_null = k_params - df_model
+        df_resid = nobs - k_params
+        cls.res2 = Holder(
+            nobs=nobs,
+            k_params=k_params,
+            df_model=df_model,
+            df_null=df_null,
+            df_resid=df_resid,
+            k_extra=df_null - 1,
+            exog_names=[
+                "zm_const", "zm_x1", "zm_alpha", "const", "x1", "alpha",
+            ],
+        )
+
+
+class TestHurdleL1(CheckLikelihoodModelL1, CheckHurdleL1Coherence):
+
+    @classmethod
+    def setup_class(cls):
+        endog = DATA["docvis"]
+        exog_names = ["aget", "totchr", "const"]
+        exog = DATA[exog_names]
+        cls.res1 = HurdleCountModel(
+            endog=endog, exog=exog, dist="poisson", zerodist="poisson"
+        ).fit_regularized(method="l1", alpha=1)
+        cls.res2 = results_t.hurdle_l1
+
+
+class TestHurdleL1Compatibility(CheckL1Compatability):
+    """
+    Many inherited tests must be overridden to separately test both the zero
+    model and the main model in the Hurdle, but the inherited tests for degrees
+    of freedom and bad r matrix are still good.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        cls.kvars = 10  # Number of variables
+        cls.m = 7  # Number of unregularized parameters
+        rand_data = load_randhie()
+        rand_data.endog = np.asarray(rand_data.endog)
+        rand_data.exog = np.asarray(rand_data.exog, dtype=float)
+        rand_exog = rand_data.exog.view(float).reshape(len(rand_data.exog), -1)
+        rand_exog_st = (rand_exog - rand_exog.mean(0)) / rand_exog.std(0)
+        rand_exog = np.hstack((np.ones((rand_exog_st.shape[0], 1)), rand_exog_st))
+        # Drop some columns and do an unregularized fit
+        exog_no_PSI = rand_exog[:, : cls.m]
+        mod_unreg = HurdleCountModel(
+            rand_data.endog, exog_no_PSI, dist="negbin", zerodist="poisson"
+        )
+        cls.res_unreg = mod_unreg.fit(method="newton", disp=0)
+        # Do a regularized fit with alpha such that it effectively drops the
+        # last column
+        alpha = 10 * len(rand_data.endog) * np.ones(2 * cls.kvars + 1)
+        alpha[: cls.m] = 0
+        alpha[cls.kvars: cls.kvars + cls.m] = 0
+        # Do not penalize alpha in nbp main model
+        alpha[-1] = 0
+
+        mod_reg = HurdleCountModel(
+            rand_data.endog, rand_exog, dist="negbin", zerodist="poisson"
+        )
+        cls.res_reg = mod_reg.fit_regularized(
+            # Non-zero starting parameters are required when fitting a negative
+            # binomial with regularization
+            start_params=np.ones(2 * cls.kvars + 1),
+            method="l1",
+            alpha=alpha,
+            disp=False,
+            acc=1e-10,
+            maxiter=2000,
+            trim_mode="auto",
+        )
+        cls.k_extra1 = 0  # no extra parameter in poisson
+        cls.k_extra2 = 1  # 1 extra parameter in nbp
+
+    def test_params(self):
+        kvars = self.kvars
+        m = self.m
+        k_extra1 = self.k_extra1
+        assert_almost_equal(
+            self.res_unreg.params[:m], self.res_reg.params[:m], 4
+        )
+        assert_almost_equal(
+            self.res_unreg.params[m + k_extra1: m + k_extra1 + m],
+            self.res_reg.params[kvars + k_extra1: kvars + k_extra1 + m],
+            4,
+        )
+        # The last entries in the regularized zero and main models should be
+        # close to zero
+        assert_almost_equal(0, self.res_reg.params[m : kvars], 4)
+        assert_almost_equal(0, self.res_reg.params[kvars + k_extra1 + m: -1], 4)
+
+    def test_cov_params(self):
+        kvars = self.kvars
+        m = self.m
+        k_extra1 = self.k_extra1
+        # The restricted cov_params should be equal, both in the zero model...
+        assert_almost_equal(
+            self.res_unreg.cov_params()[:m, :m],
+            self.res_reg.cov_params()[:m, :m],
+            1,
+        )
+        # ...and in the main model
+        assert_almost_equal(
+            self.res_unreg.cov_params()[
+                m + k_extra1:m + k_extra1 + m, m + k_extra1:m + k_extra1 + m
+            ],
+            self.res_reg.cov_params()[
+                kvars + k_extra1:kvars + k_extra1 + m,
+                kvars + k_extra1:kvars + k_extra1 + m,
+            ],
+            1,
+        )
+
+    def test_t_test(self):
+        kvars = self.kvars
+        m = self.m
+        k_extra1 = self.k_extra1
+        t_unreg = self.res_unreg.t_test(np.eye(len(self.res_unreg.params)))
+        t_reg = self.res_reg.t_test(np.eye(len(self.res_reg.params)))
+        # Zero model
+        assert_almost_equal(t_unreg.effect[:m], t_reg.effect[:m], 3)
+        assert_almost_equal(t_unreg.sd[:m], t_reg.sd[:m], 3)
+        assert_almost_equal(np.nan, t_reg.sd[m])
+        assert_allclose(t_unreg.tvalue[:m], t_reg.tvalue[:m], atol=3e-3)
+        assert_almost_equal(np.nan, t_reg.tvalue[m])
+        # Main model
+        assert_almost_equal(
+            t_unreg.effect[m + k_extra1:m + k_extra1 + m],
+            t_reg.effect[kvars + k_extra1:kvars + k_extra1 + m],
+            3,
+        )
+        assert_almost_equal(
+            t_unreg.sd[m + k_extra1:m + k_extra1 + m],
+            t_reg.sd[kvars + k_extra1:kvars + k_extra1 + m],
+            3,
+        )
+        assert_almost_equal(np.nan, t_reg.sd[kvars + k_extra1 + m])
+        assert_allclose(
+            t_unreg.tvalue[m + k_extra1:m + k_extra1 + m],
+            t_reg.tvalue[kvars + k_extra1:kvars + k_extra1 + m],
+            atol=3e-3,
+        )
+        assert_almost_equal(np.nan, t_reg.tvalue[kvars + k_extra1 + m])
+
+    def test_f_test(self):
+        m = self.m
+        kvars = self.kvars
+        k_extra1 = self.k_extra1
+        # Zero model
+        f_unreg_zero = self.res_unreg.f_test(
+            np.eye(len(self.res_unreg.params))[:m]
+        )
+        f_reg_zero = self.res_reg.f_test(np.eye(len(self.res_reg.params))[:m])
+        assert_allclose(
+            f_unreg_zero.fvalue, f_reg_zero.fvalue, rtol=1e-4, atol=5e-2
+        )
+        assert_almost_equal(f_unreg_zero.pvalue, f_reg_zero.pvalue, 3)
+        # Main model
+        f_unreg_main = self.res_unreg.f_test(
+            np.eye(len(self.res_unreg.params))[m + k_extra1:m + k_extra1 + m]
+        )
+        f_reg_main = self.res_reg.f_test(
+            np.eye(len(self.res_reg.params))[kvars + k_extra1:kvars + k_extra1 + m]
+        )
+        assert_allclose(
+            f_unreg_main.fvalue, f_reg_main.fvalue, rtol=1e-4, atol=5e-2
+        )
+        assert_almost_equal(f_unreg_main.pvalue, f_reg_main.pvalue, 3)
+
+
+@pytest.mark.parametrize(
+    "dist,zerodist", [
+        ("poisson", "poisson"),
+        ("negbin", "poisson"),
+        ("poisson", "negbin"),
+        ("negbin", "negbin"),
+    ]
+)
+def test_fit_accepts_start_params_split_across_components(dist, zerodist):
+    # HurdleCountModel.fit used to pass the same unsplit start_params vector
+    # to both component models' own .fit(), even though neither wants the
+    # full vector: the zero model needs k_exog + k_extra1 entries and the
+    # main model needs k_exog + k_extra2. Every properly-sized start_params
+    # raised a shapes-mismatch ValueError from deep inside the optimizer.
+    # Verify all four dist/zerodist combinations now accept a start_params
+    # vector sized for the whole model, and that starting from an already-
+    # converged optimum reproduces that same optimum (not just "doesn't
+    # crash").
+    rng = np.random.default_rng(0)
+    nobs = 400
+    exog = np.column_stack([np.ones(nobs), rng.standard_normal(nobs)])
+    endog = rng.poisson(np.exp(0.5 + 0.3 * exog[:, 1]))
+    endog[rng.random(nobs) < 0.1] = 0
+
+    mod = HurdleCountModel(endog, exog, dist=dist, zerodist=zerodist)
+    res_default = mod.fit(disp=0)
+
+    mod2 = HurdleCountModel(endog, exog, dist=dist, zerodist=zerodist)
+    res_explicit = mod2.fit(start_params=res_default.params, disp=0)
+    assert_allclose(res_explicit.params, res_default.params, atol=1e-6, rtol=1e-6)
+
+
+def test_fit_start_params_wrong_size_raises_clear_error():
+    rng = np.random.default_rng(0)
+    nobs = 200
+    exog = np.column_stack([np.ones(nobs), rng.standard_normal(nobs)])
+    endog = rng.poisson(np.exp(0.5 + 0.3 * exog[:, 1]))
+    endog[rng.random(nobs) < 0.1] = 0
+
+    mod = HurdleCountModel(endog, exog)  # poisson/poisson, 4 params total
+    with pytest.raises(ValueError, match="start_params must have one entry"):
+        mod.fit(start_params=np.ones(3), disp=0)
+
+
+def test_fit_regularized_converged_reports_joint_fit_too():
+    # fit_regularized runs the two component fits, then a joint refit on
+    # their concatenated solution -- params comes from that joint refit.
+    # mle_retvals["converged"] used to be overwritten with only the two
+    # component fits' flags afterward, discarding the joint refit's own
+    # flag even though it's the one that actually produced params.
+    rng = np.random.default_rng(0)
+    nobs = 300
+    exog = np.column_stack([np.ones(nobs), rng.standard_normal(nobs)])
+    endog = rng.poisson(np.exp(0.5 + 0.3 * exog[:, 1]))
+    endog[rng.random(nobs) < 0.1] = 0
+
+    mod = HurdleCountModel(endog, exog)
+    res = mod.fit_regularized(alpha=0.01, disp=0)
+    converged = res.mle_retvals["converged"]
+
+    # Previously always exactly 2 entries; a 3rd can only appear by keeping
+    # the joint fit's own flag alongside, not in place of, the components'.
+    assert len(converged) == 3
+    assert converged[0] == res.results_zero.mle_retvals["converged"]
+    assert converged[1] == res.results_count.mle_retvals["converged"]
+    assert isinstance(converged[2], (bool, np.bool_))
+
+
