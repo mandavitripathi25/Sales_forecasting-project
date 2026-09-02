@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # Sales Forecasting Pipeline
 
 A modular ensemble forecasting pipeline: ingest sales data, find the
